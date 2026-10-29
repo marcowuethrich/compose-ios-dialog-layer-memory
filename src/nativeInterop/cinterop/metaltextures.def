@@ -1,0 +1,76 @@
+language = Objective-C
+compilerOpts = -fno-objc-arc
+linkerOpts = -framework Metal -framework IOSurface
+---
+#import <Metal/Metal.h>
+#import <objc/runtime.h>
+
+// Every texture created on the default MTLDevice, held weakly: a texture is listed for as long as
+// something else (Skia, Core Animation, Compose) still keeps it.
+static NSHashTable *trackedTextures;
+
+static void track(id texture) {
+    if (texture == nil) return;
+    @synchronized (trackedTextures) { [trackedTextures addObject:texture]; }
+}
+
+static inline void startTrackingTextures(void) {
+    trackedTextures = [[NSHashTable weakObjectsHashTable] retain];
+    Class device = [MTLCreateSystemDefaultDevice() class];
+
+    SEL plain = @selector(newTextureWithDescriptor:);
+    Method plainMethod = class_getInstanceMethod(device, plain);
+    id (*makePlain)(id, SEL, MTLTextureDescriptor *) = (void *)method_getImplementation(plainMethod);
+    method_setImplementation(plainMethod, imp_implementationWithBlock(^id(id self, MTLTextureDescriptor *d) {
+        id texture = makePlain(self, plain, d);
+        track(texture);
+        return texture;
+    }));
+
+    SEL surface = @selector(newTextureWithDescriptor:iosurface:plane:);
+    Method surfaceMethod = class_getInstanceMethod(device, surface);
+    id (*makeSurface)(id, SEL, MTLTextureDescriptor *, IOSurfaceRef, NSUInteger) = (void *)method_getImplementation(surfaceMethod);
+    method_setImplementation(surfaceMethod, imp_implementationWithBlock(^id(id self, MTLTextureDescriptor *d, IOSurfaceRef s, NSUInteger p) {
+        id texture = makeSurface(self, surface, d, s, p);
+        track(texture);
+        return texture;
+    }));
+}
+
+static NSString *formatName(MTLPixelFormat format) {
+    switch (format) {
+        case MTLPixelFormatBGRA8Unorm: return @"BGRA8";
+        case MTLPixelFormatRGBA8Unorm: return @"RGBA8";
+        case MTLPixelFormatR8Unorm: return @"R8";
+        case MTLPixelFormatA8Unorm: return @"A8";
+        default: return [NSString stringWithFormat:@"format %lu", (unsigned long)format];
+    }
+}
+
+// The live textures, e.g. "50.1 MB [1 x 1536x3072 BGRA8, ...]". Counted here, so that the caller
+// never holds a texture itself.
+static inline NSString *liveTextures(void) {
+    NSString *result;
+    @autoreleasepool {
+        NSArray *textures;
+        @synchronized (trackedTextures) { textures = trackedTextures.allObjects; }
+        NSCountedSet *kinds = [NSCountedSet set];
+        NSMutableDictionary *bytesOfKind = [NSMutableDictionary dictionary];
+        double total = 0;
+        for (id<MTLTexture> texture in textures) {
+            NSString *kind = [NSString stringWithFormat:@"%lux%lu %@", (unsigned long)texture.width,
+                              (unsigned long)texture.height, formatName(texture.pixelFormat)];
+            int bytesPerPixel = texture.pixelFormat == MTLPixelFormatR8Unorm || texture.pixelFormat == MTLPixelFormatA8Unorm ? 1 : 4;
+            double bytes = (double)texture.width * texture.height * bytesPerPixel;
+            [kinds addObject:kind];
+            bytesOfKind[kind] = @([bytesOfKind[kind] doubleValue] + bytes);
+            total += bytes;
+        }
+        NSMutableArray *parts = [NSMutableArray array];
+        for (NSString *kind in [bytesOfKind keysSortedByValueUsingSelector:@selector(compare:)].reverseObjectEnumerator) {
+            [parts addObject:[NSString stringWithFormat:@"%lu x %@", (unsigned long)[kinds countForObject:kind], kind]];
+        }
+        result = [[NSString alloc] initWithFormat:@"%.1f MB [%@]", total / 1048576.0, [parts componentsJoinedByString:@", "]];
+    }
+    return [result autorelease];
+}
